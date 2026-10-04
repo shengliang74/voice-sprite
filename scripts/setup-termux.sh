@@ -13,5 +13,8 @@ fi
 if [ ! -f persona.txt ]; then
   cp persona.example.txt persona.txt
 fi
-chmod 600 .env
+if [ ! -f memory.json ]; then
+  cp memory.example.json memory.json
+fi
+chmod 600 .env memory.json
 echo "安装完成。编辑 .env 填写两个 API Key，然后运行 python voice_sprite.py --doctor"

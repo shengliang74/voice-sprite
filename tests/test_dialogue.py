@@ -46,7 +46,7 @@ class PreferenceTests(unittest.TestCase):
         import voice_sprite as app
         env = {p + '_' + s: 'test' for p in ('ASR', 'LLM') for s in ('API_KEY', 'BASE_URL', 'MODEL')}
         with tempfile.TemporaryDirectory() as tmp, patch.object(app, 'ROOT', Path(tmp)), \
-             patch.dict(os.environ, env, clear=True), patch.object(app, 'load_env'), \
+             patch.dict(os.environ, dict(env, WAKE_ENABLED='0', INTRO_ENABLED='0'), clear=True), patch.object(app, 'load_env'), \
              patch.object(app, 'load_persona', return_value='Tutor'), \
              patch.object(app, 'prepare_auto', return_value='mic'), \
              patch.object(app, 'record_auto', side_effect=[Path('fake.wav'), KeyboardInterrupt]), \

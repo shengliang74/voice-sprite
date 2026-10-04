@@ -57,3 +57,11 @@ class CloudSpeechTests(unittest.TestCase):
             with self.assertRaises(cloud.SpeechError):
                 cloud.speak_cloud('Hello', Mock(return_value=b'{"error":"failed"}'), Mock(), app.setting, app.number)
             play.assert_not_called()
+
+    def test_paused_at_end_is_completion(self):
+        command=Mock(side_effect=['Now Playing: reply.mp3','Status: Paused\nTrack: reply.mp3\nCurrent Position: 00:36 / 00:36','Stopped'])
+        cloud.play_file(Path('reply.mp3'),command)
+
+    def test_paused_midway_is_still_error(self):
+        command=Mock(side_effect=['Now Playing: reply.mp3','Status: Paused\nTrack: reply.mp3\nCurrent Position: 00:10 / 00:36','Stopped'])
+        with self.assertRaises(cloud.SpeechError):cloud.play_file(Path('reply.mp3'),command)

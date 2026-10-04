@@ -8,6 +8,7 @@ import subprocess
 import time
 import tempfile
 import wave
+from event_log import emit
 
 RATE = 16000
 FRAME_SAMPLES = 320  # 20 ms, signed 16-bit mono
@@ -30,6 +31,28 @@ class EndpointDetector:
         self.voiced = 0
         self.quiet = 0
         self.elapsed = 0
+        self.end_reason = None
+        self.rms_histogram = [0] * 33
+        self.total_frames = self.above_frames = self.triggers = 0
+        self.accepted = self.rejected = self.rms_peak = 0
+        self.rms_sum = 0.0
+
+    def statistics(self):
+        def percentile(fraction):
+            target = max(1, math.ceil(self.total_frames * fraction))
+            count = 0
+            for index, frequency in enumerate(self.rms_histogram):
+                count += frequency
+                if count >= target:
+                    return (index + 1) * 100
+            return 0
+        return dict(frames=self.total_frames, above_threshold_frames=self.above_frames,
+                    threshold=self.threshold, triggers=self.triggers,
+                    accepted=self.accepted, rejected=self.rejected,
+                    rms_peak=round(self.rms_peak),
+                    rms_mean=round(self.rms_sum / max(1, self.total_frames)),
+                    rms_p50_bucket=percentile(0.5), rms_p95_bucket=percentile(0.95),
+                    silence_ms=self.silence_frames*20, min_speech_ms=self.minimum_frames*20)
 
     @property
     def speaking(self):
@@ -39,10 +62,16 @@ class EndpointDetector:
         samples = struct.unpack('<320h', pcm)
         rms = math.sqrt(sum(s * s for s in samples) / FRAME_SAMPLES)
         loud = rms >= self.threshold
+        self.total_frames += 1
+        self.above_frames += int(loud)
+        self.rms_sum += rms
+        self.rms_peak = max(self.rms_peak, rms)
+        self.rms_histogram[min(32, int(rms // 100))] += 1
         if not self.speaking:
             if not loud:
                 self.preroll.append(pcm)
                 return None
+            self.triggers += 1
             self.frames = list(self.preroll)
             self.preroll.clear()
         self.frames.append(pcm)
@@ -50,7 +79,10 @@ class EndpointDetector:
         self.voiced += int(loud)
         self.quiet = 0 if loud else self.quiet + 1
         if self.quiet >= self.silence_frames or self.elapsed >= self.maximum_frames:
+            self.end_reason = 'maximum' if self.elapsed >= self.maximum_frames else 'silence'
             result = b''.join(self.frames) if self.voiced >= self.minimum_frames else None
+            self.accepted += int(result is not None)
+            self.rejected += int(result is None)
             self.frames = []
             self.voiced = self.quiet = self.elapsed = 0
             return result
@@ -72,7 +104,7 @@ def stop_capture(process):
 
 def record_utterance(path, source, detector, idle_seconds):
     """Return a WAV path, or None after idle timeout. Always close capture first."""
-    with tempfile.TemporaryFile() as errors:
+    with open(os.devnull, "wb") as errors:
         try:
             process = subprocess.Popen([
                 'parec', '--raw', '--format=s16le', '--rate=16000', '--channels=1',
@@ -90,8 +122,7 @@ def record_utterance(path, source, detector, idle_seconds):
                 if ready:
                     chunk = os.read(process.stdout.fileno(), 4096)
                     if not chunk:
-                        errors.seek(0)
-                        detail = errors.read(1000).decode('utf-8', errors='replace')
+                        detail = 'parec exit=' + str(process.poll())
                         raise AudioError('麦克风音频流已关闭：' + detail)
                     last_data = now
                     buffer += chunk
@@ -102,6 +133,8 @@ def record_utterance(path, source, detector, idle_seconds):
                         if not was_speaking and detector.speaking:
                             print('检测到声音，正在录音……', flush=True)
                         if audio is not None:
+                            emit("record_end", reason=detector.end_reason, duration_ms=round(len(audio)/32))
+                            print("达到最长录音限制，结束本轮。" if detector.end_reason == "maximum" else "检测到持续停顿，结束本轮。", flush=True)
                             with wave.open(str(path), 'wb') as wav:
                                 wav.setnchannels(1)
                                 wav.setsampwidth(2)
@@ -114,4 +147,6 @@ def record_utterance(path, source, detector, idle_seconds):
                     return None
         finally:
             stop_capture(process)
+            if detector is not None:
+                emit("vad_summary", **detector.statistics())
 

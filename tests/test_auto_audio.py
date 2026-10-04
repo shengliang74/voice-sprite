@@ -114,3 +114,16 @@ class CaptureTests(unittest.TestCase):
             self.assertIsNone(auto_audio.record_utterance(path, 'test', detector, 30))
             self.assertFalse(path.exists())
         process.terminate.assert_called_once()
+
+class DiagnosticsTests(unittest.TestCase):
+    def test_bounded_statistics_distinguish_noise_and_voice(self):
+        detector=EndpointDetector(threshold=500,silence=0.2,minimum=0.06,maximum=3)
+        for _ in range(100):detector.feed(frame(100))
+        for _ in range(10):detector.feed(frame(1000))
+        for _ in range(10):detector.feed(frame(0))
+        stats=detector.statistics()
+        self.assertEqual(stats['frames'],120)
+        self.assertEqual(stats['above_threshold_frames'],10)
+        self.assertEqual(stats['accepted'],1)
+        self.assertEqual(stats['rms_peak'],1000)
+        self.assertEqual(len(detector.rms_histogram),33)

@@ -19,7 +19,7 @@ class AutoLoopTests(unittest.TestCase):
                 raise app.AppError('tts timeout')
         env = {prefix + '_' + suffix: 'test' for prefix in ('ASR', 'LLM')
                for suffix in ('API_KEY', 'BASE_URL', 'MODEL')}
-        with patch.dict(os.environ, env, clear=True), patch.object(app, 'load_env'), \
+        with patch.dict(os.environ, dict(env, WAKE_ENABLED='0', INTRO_ENABLED='0'), clear=True), patch.object(app, 'load_env'), \
              patch.object(app, 'load_persona', return_value='Tutor'), \
              patch.object(app, 'prepare_auto', return_value='mic'), \
              patch.object(app, 'record_auto', side_effect=capture), \

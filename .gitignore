@@ -11,3 +11,9 @@ dist/
 persona.txt
 
 conversation.json
+
+memory.json
+
+.intro_done
+
+logs/

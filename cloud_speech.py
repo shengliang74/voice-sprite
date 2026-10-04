@@ -1,5 +1,6 @@
 """SiliconFlow speech synthesis and Android media playback."""
 import json
+import re
 from pathlib import Path
 import tempfile
 import time
@@ -19,6 +20,16 @@ def play_file(path, command, timeout=180):
             status = command(['termux-media-player', 'info'])
             if status.strip() == 'No track currently!':
                 return
+            position = re.search(r'Current Position: ([0-9:]+) / ([0-9:]+)', status)
+            if status.startswith('Status: Paused') and position:
+                def seconds(value):
+                    total = 0
+                    for part in value.split(':'):
+                        total = total * 60 + int(part)
+                    return total
+                current, duration = map(seconds, position.groups())
+                if duration > 0 and current >= duration:
+                    return
             if not status.startswith('Status: Playing'):
                 raise SpeechError('播放已暂停或状态异常：' + status[:300])
             time.sleep(0.2)

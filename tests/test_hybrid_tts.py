@@ -4,6 +4,11 @@ from unittest.mock import patch
 import voice_sprite as app
 
 class HybridTests(unittest.TestCase):
+    def setUp(self):
+        notice = patch.object(app, 'notify_voice')
+        notice.start()
+        self.addCleanup(notice.stop)
+
     def test_chinese_uses_explicit_local_engine(self):
         with patch.dict(os.environ, {'TTS_PROVIDER':'hybrid','TTS_LANGUAGE':'zh','TTS_ZH_ENGINE':'example.xiaoya'}, clear=True), patch.object(app,'command') as command, patch.object(app,'speak_cloud') as cloud, patch.object(app.time,'sleep'):
             app.speak('你好')
@@ -32,3 +37,10 @@ class HybridTests(unittest.TestCase):
             with self.assertRaises(app.AppError):
                 app.speak('你好')
             command.assert_not_called()
+
+    def test_bilingual_sentences_use_matching_backends(self):
+        with patch.dict(os.environ, {'TTS_PROVIDER':'hybrid','TTS_LANGUAGE':'en','TTS_ZH_ENGINE':'example.xiaoya'}, clear=True), patch.object(app,'command') as command, patch.object(app,'speak_cloud') as cloud, patch.object(app.time,'sleep'):
+            app.speak('星星很远。Stars are far away.')
+            self.assertEqual(command.call_args.kwargs['text'],'星星很远。')
+            self.assertEqual(cloud.call_args.args[0],'Stars are far away.')
+            self.assertEqual(os.environ['TTS_LANGUAGE'],'en')

@@ -2,6 +2,7 @@
 """Termux English conversation tutor; Python standard library only."""
 import argparse
 import json
+import re
 import os
 from pathlib import Path
 import select
@@ -15,8 +16,11 @@ import urllib.parse
 import urllib.request
 import uuid
 
+from event_log import configure as configure_log, emit
+from usage_help import help_reply, introduce_once
+from memory_wake import Memory, WakeSession
 from dialogue import Preferences, PreferenceError
-from cloud_speech import speak_cloud, SpeechError
+from cloud_speech import speak_cloud, SpeechError, play_file
 from auto_audio import AudioError, EndpointDetector, record_utterance
 
 ROOT = Path(__file__).resolve().parent
@@ -64,9 +68,11 @@ def command(args, *, timeout=20, text=None):
     except FileNotFoundError as exc:
         raise AppError(f"缺少命令 {args[0]}，请按 README 安装依赖") from exc
     except subprocess.TimeoutExpired as exc:
+        emit("command_timeout", service=args[0], duration_ms=timeout*1000)
         raise AppError(f"{args[0]} 超时；检查 Termux:API、权限及后台限制") from exc
     output = result.stdout.strip()
     if result.returncode:
+        emit("command_failed", service=args[0], status=result.returncode)
         raise AppError(f"{args[0]} 失败：{result.stderr.strip()[:400]}")
     # Termux API sometimes returns an error object with exit status zero.
     try:
@@ -97,6 +103,8 @@ def post(prefix, route, body, content_type, *, binary=False):
         "Authorization": "Bearer " + key, "Content-Type": content_type,
         "Accept": "audio/mpeg" if binary else "application/json", "User-Agent": "voice-sprite/0.1",
     })
+    started = time.monotonic()
+    emit("request_start", service=prefix)
     try:
         with urllib.request.build_opener(NoRedirect).open(
                 request, timeout=number("HTTP_TIMEOUT", 90, 1, 300)) as response:
@@ -105,15 +113,22 @@ def post(prefix, route, body, content_type, *, binary=False):
                 if len(data) > 20 * 1024 * 1024:
                     raise AppError("TTS 音频超过 20 MB 限制")
             else:
-                data = json.load(response)
+                raw = response.read(2 * 1024 * 1024 + 1)
+                if len(raw) > 2 * 1024 * 1024:
+                    raise AppError("JSON response exceeds 2 MiB")
+                data = json.loads(raw)
     except urllib.error.HTTPError as exc:
+        emit("request_error", service=prefix, status=exc.code, error_type=type(exc).__name__, duration_ms=round((time.monotonic()-started)*1000))
         hints = {401: "API Key 无效", 403: "权限或额度不足", 402: "余额不足",
                  404: "检查接口地址及模型名称", 429: "请求过多或额度不足"}
         raise AppError(f"{prefix} HTTP {exc.code}：" + hints.get(exc.code, "服务异常，请稍后重试")) from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        cause = getattr(exc, "reason", exc)
+        emit("request_error", service=prefix, error_type=type(exc).__name__, cause_type=type(cause).__name__, errno=getattr(cause,"errno",None), duration_ms=round((time.monotonic()-started)*1000))
         raise AppError(f"{prefix} 网络连接失败或超时，请检查网络后重试") from exc
     except ValueError as exc:
         raise AppError(f"{prefix} 返回的不是有效 JSON") from exc
+    emit("request_complete", service=prefix, duration_ms=round((time.monotonic()-started)*1000))
     return data
 
 
@@ -164,14 +179,14 @@ def prepare_auto():
     return "voice_sprite_mic"
 
 
-def record_auto(directory, source):
+def record_auto(directory, source, idle_seconds=None):
     detector = EndpointDetector(
         threshold=number("VAD_THRESHOLD", 600, 1, 32767),
-        silence=number("SILENCE_SECONDS", 1.8, 0.3, 10),
+        silence=number("SILENCE_SECONDS", 3, 0.3, 10),
         minimum=number("MIN_SPEECH_SECONDS", 0.3, 0.04, 2),
-        maximum=number("RECORD_SECONDS", 30, 2, 120))
+        maximum=number("RECORD_SECONDS", 120, 2, 120))
     return record_utterance(directory / "speech.wav", source, detector,
-                            number("LISTEN_TIMEOUT", 30, 5, 300))
+                            number("LISTEN_TIMEOUT", 30, 5, 300) if idle_seconds is None else idle_seconds)
 
 
 def reply(text, history, preferences=None):
@@ -179,6 +194,7 @@ def reply(text, history, preferences=None):
     persona = load_persona()
     if preferences is not None:
         persona += "\n" + preferences.instruction()
+    persona += Memory(ROOT / "memory.json").instruction()
     messages = [{"role": "system", "content": persona}] + history[-turns * 2:]
     messages.append({"role": "user", "content": text})
     payload = {"model": setting("LLM_MODEL"), "messages": messages,
@@ -198,6 +214,38 @@ def reply(text, history, preferences=None):
     return answer.strip()
 
 
+def notify_voice(event):
+    """Best-effort local prerecorded notice; never recursively use cloud TTS."""
+    if setting("AUDIO_PROMPTS", "1") != "1":
+        return
+    if event not in ("synthesizing", "error", "paused"):
+        return
+    path = ROOT / "assets" / "prompts" / (event + ".wav")
+    try:
+        if not path.is_file():
+            raise AppError("提示音文件缺失，请更新完整部署包")
+        def prompt_command(args):
+            return command(args, timeout=3)
+        play_file(path, prompt_command, timeout=12)
+    except (AppError, SpeechError, OSError) as exc:
+        print("语音通知未能播放：", exc, file=sys.stderr)
+
+
+def introduce(preferences, text_mode=False):
+    if setting("INTRO_ENABLED", "1") != "1":
+        return False
+    def deliver(text):
+        print(text, flush=True)
+        if not text_mode:
+            previous = os.environ.get("TTS_LANGUAGE", "zh")
+            try:
+                os.environ["TTS_LANGUAGE"] = "zh"
+                speak(text)
+            finally:
+                os.environ["TTS_LANGUAGE"] = previous
+    return introduce_once(ROOT / ".intro_done", preferences.name, deliver)
+
+
 def speech_provider():
     provider = setting("TTS_PROVIDER", "siliconflow")
     if provider == "hybrid":
@@ -208,8 +256,28 @@ def speech_provider():
 
 
 def speak(text):
+    # Hybrid bilingual answers must use the correct voice for each sentence.
+    if setting("TTS_PROVIDER") != "hybrid":
+        return speak_single(text)
+    previous = os.environ.get("TTS_LANGUAGE")
+    try:
+        for sentence in re.split(r'(?<=[。！？!?])|(?<=\.)\s+|\n+', text):
+            sentence = sentence.strip()
+            if not any(c.isalnum() for c in sentence):
+                continue
+            os.environ["TTS_LANGUAGE"] = "zh" if re.search(r'[\u4e00-\u9fff]', sentence) else "en"
+            speak_single(sentence)
+    finally:
+        if previous is None:
+            os.environ.pop("TTS_LANGUAGE", None)
+        else:
+            os.environ["TTS_LANGUAGE"] = previous
+
+
+def speak_single(text):
     provider = speech_provider()
     if provider == "siliconflow":
+        notify_voice("synthesizing")
         speak_cloud(text, post, command, setting, number)
         time.sleep(number("PLAYBACK_COOLDOWN", 0.8, 0, 5))
         return
@@ -229,7 +297,7 @@ def speak(text):
 
 def record(directory):
     source, target = directory / "speech.m4a", directory / "speech.wav"
-    seconds = int(number("RECORD_SECONDS", 30, 2, 120))
+    seconds = int(number("RECORD_SECONDS", 120, 2, 120))
     info = command(["termux-microphone-record", "-i"])
     try:
         if json.loads(info).get("isRecording"):
@@ -292,6 +360,7 @@ def main():
     args = parser.parse_args()
     if args.tts_language and not args.tts_test:
         parser.error("--tts-language 需要与 --tts-test 一起使用")
+    configure_log(ROOT / "logs")
     load_env(ROOT / ".env")
     if args.doctor:
         return doctor()
@@ -314,6 +383,20 @@ def main():
     load_persona()  # Fail before capturing audio or calling cloud services.
     source = prepare_auto() if args.auto else None
     history, last = [], ""
+    memory = Memory(ROOT / "memory.json")
+    wake = WakeSession(number("SLEEP_AFTER_SECONDS", 60, 5, 3600)) if args.auto and setting("WAKE_ENABLED", "1") == "1" else None
+    try:
+        introduced = introduce(preferences, args.text)
+        if introduced and wake:
+            wake.active = True
+            wake.replied(time.monotonic())
+            print("介绍完成，可以直接说话；待机后连续叫两遍当前名字可唤起。")
+    except (AppError, PreferenceError, SpeechError) as exc:
+        print("首次介绍未完成：", exc, file=sys.stderr)
+        if not args.text:
+            notify_voice("error")
+    if wake and not wake.active:
+        print(f"待机：请连续叫两遍名字“{preferences.name}”；有声音时仍会上传 ASR 识别。")
     while True:
         entry = "" if args.auto else input("\n输入：" if args.text else "按回车开始录音（请等音箱播放完），或输入命令：").strip()
         if entry == "/quit":
@@ -329,6 +412,11 @@ def main():
             print("朗读语速：", setting(rate_key))
             continue
         try:
+            preferences = Preferences(ROOT / "conversation.json")
+            os.environ["TTS_LANGUAGE"] = preferences.language
+            if wake and wake.expire(time.monotonic()):
+                emit("session", action="idle_sleep")
+                print(f"已静默待机，请连续叫两遍“{preferences.name}”。")
             if entry == "/repeat":
                 if last:
                     print(last)
@@ -343,8 +431,12 @@ def main():
                     print("语音模式请直接按回车；文字模式使用 --text")
                     continue
                 with tempfile.TemporaryDirectory(prefix="voice-sprite-") as tmp:
-                    path = record_auto(Path(tmp), source) if args.auto else record(Path(tmp))
+                    idle = number("LISTEN_TIMEOUT", 30, 5, 300)
+                    if wake and wake.active:
+                        idle = max(0.2, min(idle, wake.idle_seconds - (time.monotonic() - wake.last_reply)))
+                    path = record_auto(Path(tmp), source, idle) if args.auto else record(Path(tmp))
                     if path is None:
+                        emit("listen_idle")
                         print("未检测到足够长的声音，继续监听（未调用云端）。")
                         continue
                     print("正在识别……")
@@ -352,7 +444,43 @@ def main():
                 print("你：", entry)
             if not entry:
                 continue
-            confirmation = preferences.handle(entry)
+            # Reload after capture too: edits made while listening apply to this turn.
+            preferences = Preferences(ROOT / "conversation.json")
+            os.environ["TTS_LANGUAGE"] = preferences.language
+            if wake:
+                action = wake.accept(entry, preferences.name, time.monotonic())
+                emit("wake_decision", action=action, characters=len(entry))
+                if action in ("ignore", "sleep"):
+                    if action == "sleep":
+                        print("已进入待机。")
+                    continue
+                if action == "wake":
+                    print(preferences.name + "：你好，我在。")
+                    previous_language = os.environ.get("TTS_LANGUAGE", "zh")
+                    try:
+                        os.environ["TTS_LANGUAGE"] = "zh"
+                        speak("你好，我在。")
+                    finally:
+                        os.environ["TTS_LANGUAGE"] = previous_language
+                    wake.replied(time.monotonic())
+                    continue
+            assistance = help_reply(entry, preferences.name)
+            if assistance is not None:
+                last = assistance
+                print(preferences.name + "：", last)
+                if not args.text:
+                    previous = os.environ.get("TTS_LANGUAGE", "zh")
+                    try:
+                        os.environ["TTS_LANGUAGE"] = "zh"
+                        speak(last)
+                    finally:
+                        os.environ["TTS_LANGUAGE"] = previous
+                if wake:
+                    wake.replied(time.monotonic())
+                continue
+            confirmation = memory.handle(entry)
+            if confirmation is None:
+                confirmation = preferences.handle(entry)
             if confirmation is not None:
                 history.clear()
                 os.environ["TTS_LANGUAGE"] = preferences.language
@@ -364,10 +492,16 @@ def main():
             print(preferences.name + "：", last)
             if not args.text:
                 speak(last)
+            if wake:
+                wake.replied(time.monotonic())
         except (AppError, AudioError, PreferenceError, SpeechError) as exc:
+            emit("turn_error", error_type=type(exc).__name__, cause_type=type(exc.__cause__).__name__, action="paused" if args.auto else "retry")
             print("错误：", exc, file=sys.stderr)
+            if not args.text:
+                notify_voice("paused" if args.auto else "error")
             if args.auto:
                 answer = input("自动监听已暂停；回车继续，输入 /quit 退出：").strip()
+                emit("session", action="quit" if answer == "/quit" else "resume")
                 if answer == "/quit":
                     return 0
             else:
